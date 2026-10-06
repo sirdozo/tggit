@@ -90,9 +90,8 @@ def _create_or_get_repo(
             return repo
         except GithubException as e:
             if e.status == 422 and "already exists" in str(e.data).lower():
-                raise ValueError(
-                    f"Repository `{repo_name}` already exists. Use existing-repo mode."
-                )
+                # Already exists → fall back to existing
+                return user.get_repo(repo_name)
             raise
     else:
         if "/" in repo_name:
@@ -190,10 +189,10 @@ HELP_TEXT = """
 
 2. Send a **ZIP file** of your project.
 
-3. Answer the questions the bot asks:
-   - Create new repo **or** upload into existing one
-   - Repository name
-   - (optional) private / public, branch, commit message, sub-folder
+Bot will automatically:
+• Create a new repo (or use existing if same name already exists)
+• Use ZIP filename as repo name
+• Public repo, branch `main`, commit message "Upload from Telegram bot"
 
 Commands:
 • `/start` – welcome
@@ -324,96 +323,21 @@ async def document_handler(client: Client, message: Message):
             )
             return
 
-        await status.edit_text(
-            f"Found **{len(files)}** files.\n\n"
-            "Do you want to **create a new repository** or **upload into an existing one**?\n"
-            "Reply with `new` or `existing`."
-        )
+        # ========== DEFAULTS (no questions) ==========
+        # Repo name = ZIP filename without .zip
+        repo_name = Path(file_name).stem
+        repo_name = re.sub(r"[^\w.\-]", "-", repo_name).strip("-") or "uploaded-project"
 
-        try:
-            mode_msg = await message.chat.ask(
-                filters=filters.text & filters.user(user_id),
-                timeout=120,
-            )
-        except ListenerTimeout:
-            await status.edit_text("Timed out. Send the ZIP again when ready.")
-            return
-
-        mode = mode_msg.text.strip().lower()
-        create_new = mode in ("new", "create", "n", "c")
-
-        if mode not in (
-            "new",
-            "create",
-            "n",
-            "c",
-            "existing",
-            "exist",
-            "e",
-            "old",
-        ):
-            await message.reply("Please answer `new` or `existing`. Aborting.")
-            return
-
-        try:
-            name_msg = await message.chat.ask(
-                "Repository name"
-                + (
-                    " (will be created under your account)"
-                    if create_new
-                    else " (e.g. `my-project` or `owner/my-project`)"
-                )
-                + ":",
-                filters=filters.text & filters.user(user_id),
-                timeout=120,
-            )
-        except ListenerTimeout:
-            await message.reply("Timed out.")
-            return
-
-        repo_name = name_msg.text.strip().replace(" ", "-")
-
-        if not re.match(r"^[\w.\-]+(/[\w.\-]+)?$", repo_name):
-            await message.reply("Invalid repository name.")
-            return
-
-        try:
-            opts_msg = await message.chat.ask(
-                "Optional settings (press Enter / send `-` to use defaults):\n"
-                "• `private` – make the repo private (only for new)\n"
-                "• `branch=main` – target branch\n"
-                "• `msg=Your commit message`\n"
-                "• `path=subdir` – upload into a sub-folder\n\n"
-                "Example: `private branch=main msg=Initial upload path=src`",
-                filters=filters.text & filters.user(user_id),
-                timeout=120,
-            )
-            opts_text = opts_msg.text.strip()
-        except ListenerTimeout:
-            opts_text = ""
-
-        private = False
+        create_new = True          # try create new, fallback to existing if already exists
+        private = False            # public by default
         branch = "main"
         commit_message = "Upload from Telegram bot"
         target_subdir = ""
-
-        if opts_text and opts_text != "-":
-            if "private" in opts_text.lower():
-                private = True
-
-            m = re.search(r"branch=([^\s]+)", opts_text, re.I)
-            if m:
-                branch = m.group(1)
-
-            m = re.search(r"msg=(.+?)(?:\s+\w+=|$)", opts_text, re.I)
-            if m:
-                commit_message = m.group(1).strip()
-
-            m = re.search(r"path=([^\s]+)", opts_text, re.I)
-            if m:
-                target_subdir = m.group(1)
+        # =============================================
 
         await status.edit_text(
+            f"Found **{len(files)}** files.\n"
+            f"Repo: `{repo_name}` (public, branch `{branch}`)\n\n"
             "🚀 Uploading to GitHub… this may take a moment."
         )
 
