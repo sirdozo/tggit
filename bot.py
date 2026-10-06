@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-
 import asyncio
 import base64
 import json
@@ -12,14 +11,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 from dotenv import load_dotenv
 from github import Github, GithubException, InputGitTreeElement
 from github.Repository import Repository
 from wzgram import Client, filters
 from wzgram.errors import ListenerTimeout
 from wzgram.types import Message
-
+from web import start_web
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -462,11 +460,14 @@ async def document_handler(client: Client, message: Message):
 
 if __name__ == "__main__":
     if not all([API_ID, API_HASH, BOT_TOKEN]):
-        print(
-            "Please set API_ID, API_HASH and BOT_TOKEN environment variables "
-            "(or in a .env file)."
-        )
+        print("Please set API_ID, API_HASH and BOT_TOKEN environment variables.")
         raise SystemExit(1)
 
-    print("Bot starting…")
-    app.run()
+    async def main():
+        port = int(os.getenv("PORT", "8080"))
+        await start_web(port)
+        await app.start()
+        print("Bot started…")
+        await asyncio.Event().wait()
+
+    asyncio.run(main())
