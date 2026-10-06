@@ -8,30 +8,57 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
+from logging import (
+    ERROR,
+    INFO,
+    WARNING,
+    FileHandler,
+    StreamHandler,
+    basicConfig,
+    getLogger,
+)
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 from dotenv import load_dotenv
-from github import Github, GithubException, InputGitTreeElement, Auth
+from github import Auth, Github, GithubException, InputGitTreeElement
 from github.Repository import Repository
 from wzgram import Client, filters
 from wzgram.errors import ListenerTimeout
 from wzgram.types import Message
 from web import start_web
+
 load_dotenv()
 
+# ─── Logging ────────────────────────────────────────────────────────────────
+getLogger("wzgram").setLevel(ERROR)
+getLogger("pyrogram").setLevel(ERROR)
+getLogger("aiohttp").setLevel(WARNING)
+getLogger("urllib3").setLevel(WARNING)
+
+basicConfig(
+    format="[%(asctime)s] [%(levelname)s] - %(message)s",
+    datefmt="%d-%b-%y %I:%M:%S %p",
+    handlers=[FileHandler("log.txt"), StreamHandler()],
+    level=INFO,
+)
+LOGGER = getLogger(__name__)
+
+# ─── Config ─────────────────────────────────────────────────────────────────
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 DATA_DIR = Path(__file__).parent / "data"
 TOKENS_FILE = DATA_DIR / "tokens.json"
+LOG_FILE = Path("log.txt")
 
 MAX_ZIP_BYTES = 100 * 1024 * 1024
 
 
 def _gh(token: str) -> Github:
-    """Create authenticated Github client (no deprecation warning)."""
     return Github(auth=Auth.Token(token))
 
 
@@ -74,7 +101,8 @@ def _validate_token(token: str) -> Tuple[bool, str]:
         user = g.get_user()
         return True, f"Authenticated as **{user.login}**"
     except GithubException as e:
-        return False, f"Invalid token: {e.data.get('message', str(e)) if e.data else str(e)}"
+        msg = e.data.get("message", str(e)) if e.data else str(e)
+        return False, f"Invalid token: {msg}"
     except Exception as e:
         return False, f"Error: {e}"
 
@@ -83,31 +111,89 @@ def _create_or_get_repo(
     token: str,
     repo_name: str,
     *,
-    create_new: bool,
     private: bool = True,
     description: str = "",
 ) -> Repository:
     g = _gh(token)
     user = g.get_user()
 
-    if create_new:
-        try:
-            # auto_init=True → repo is never empty (README created)
-            repo = user.create_repo(
-                name=repo_name,
-                private=private,
-                description=description or "Uploaded via Telegram bot",
-                auto_init=True,
-            )
+    try:
+        LOGGER.info("Creating repo %s (private=%s, auto_init=True)", repo_name, private)
+        repo = user.create_repo(
+            name=repo_name,
+            private=private,
+            description=description or "Uploaded via Telegram bot",
+            auto_init=True,
+        )
+        # Give GitHub a moment to finish initialising the default branch
+        time.sleep(1.5)
+        # Refresh so default_branch is populated
+        repo = user.get_repo(repo_name)
+        LOGGER.info("Repo created: %s  default_branch=%s", repo.html_url, repo.default_branch)
+        return repo
+    except GithubException as e:
+        if e.status == 422 and "already exists" in str(e.data).lower():
+            LOGGER.info("Repo %s already exists – using existing", repo_name)
+            repo = user.get_repo(repo_name)
             return repo
-        except GithubException as e:
-            if e.status == 422 and "already exists" in str(e.data).lower():
-                return user.get_repo(repo_name)
-            raise
-    else:
-        if "/" in repo_name:
-            return g.get_repo(repo_name)
-        return user.get_repo(repo_name)
+        LOGGER.exception("Failed to create/get repo %s", repo_name)
+        raise
+
+
+def _ensure_branch(repo: Repository, branch: str) -> str:
+    """
+    Make sure `branch` exists.
+    If the repo is completely empty, seed it with a .gitkeep via the Contents API
+    (this is the only reliable way to initialise an empty GitHub repo).
+    Returns the branch name that should be used for the upload.
+    """
+    # 1. Preferred branch already exists?
+    try:
+        repo.get_branch(branch)
+        LOGGER.info("Branch '%s' already exists", branch)
+        return branch
+    except GithubException:
+        pass
+
+    # 2. Try the repo's default branch
+    try:
+        default = repo.default_branch
+        if default and default != branch:
+            try:
+                repo.get_branch(default)
+                LOGGER.info("Using existing default branch '%s' instead of '%s'", default, branch)
+                return default
+            except GithubException:
+                pass
+    except Exception:
+        pass
+
+    # 3. Try common names
+    for candidate in ("main", "master"):
+        if candidate == branch:
+            continue
+        try:
+            repo.get_branch(candidate)
+            LOGGER.info("Using existing branch '%s'", candidate)
+            return candidate
+        except GithubException:
+            pass
+
+    # 4. Repo is empty → seed it
+    LOGGER.info("Repo is empty – seeding branch '%s' with .gitkeep", branch)
+    try:
+        repo.create_file(
+            path=".gitkeep",
+            message="Initial commit",
+            content="",
+            branch=branch,
+        )
+        LOGGER.info("Seeded empty repo on branch '%s'", branch)
+        return branch
+    except GithubException as e:
+        msg = e.data.get("message", str(e)) if e.data else str(e)
+        LOGGER.error("Failed to seed empty repo: %s", msg)
+        raise
 
 
 def _collect_files(extract_dir: Path) -> Dict[str, bytes]:
@@ -137,26 +223,18 @@ def _upload_files_single_commit(
     if not files:
         raise ValueError("No files to upload")
 
+    # Guarantee the branch exists (handles completely empty repos)
+    branch = _ensure_branch(repo, branch)
+    LOGGER.info("Uploading %d files to %s@%s", len(files), repo.full_name, branch)
+
     prefix = target_subdir.strip("/").strip()
     if prefix:
         prefix += "/"
 
-    # Detect whether the repo already has the target branch
-    base_tree = None
-    parents = []
-    is_new_branch = True
-    ref = None
-
-    try:
-        ref = repo.get_git_ref(f"heads/{branch}")
-        base_sha = ref.object.sha
-        base_tree = repo.get_git_tree(base_sha)
-        parent = repo.get_git_commit(base_sha)
-        parents = [parent]
-        is_new_branch = False
-    except GithubException:
-        # Repo is empty or branch does not exist yet
-        pass
+    ref = repo.get_git_ref(f"heads/{branch}")
+    base_sha = ref.object.sha
+    base_tree = repo.get_git_tree(base_sha)
+    parent = repo.get_git_commit(base_sha)
 
     element_list: List[InputGitTreeElement] = []
 
@@ -181,22 +259,15 @@ def _upload_files_single_commit(
             )
         element_list.append(element)
 
-    # Only pass base_tree when the repo is not empty
-    if base_tree is not None:
-        tree = repo.create_git_tree(element_list, base_tree)
-    else:
-        tree = repo.create_git_tree(element_list)
+    tree = repo.create_git_tree(element_list, base_tree)
+    commit = repo.create_git_commit(commit_message, tree, [parent])
+    ref.edit(commit.sha)
 
-    commit = repo.create_git_commit(commit_message, tree, parents)
-
-    if is_new_branch:
-        repo.create_git_ref(f"refs/heads/{branch}", commit.sha)
-    else:
-        ref.edit(commit.sha)
-
+    LOGGER.info("Commit created: %s", commit.html_url)
     return commit.html_url
 
 
+# ─── Bot ────────────────────────────────────────────────────────────────────
 app = Client(
     "github_uploader_bot",
     api_id=API_ID,
@@ -224,6 +295,7 @@ Commands:
 • `/clear_token` – remove stored token
 • `/help` – this message
 • `/status` – show whether a token is stored
+• `/log` – send the bot log file
 """
 
 
@@ -251,6 +323,21 @@ async def status_handler(client: Client, message: Message):
             await message.reply(f"⚠️ Token is stored but invalid:\n{info}")
     else:
         await message.reply("❌ No token stored. Use `/set_token <your_PAT>`")
+
+
+@app.on_message(filters.command("log") & filters.private)
+async def log_handler(client: Client, message: Message):
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
+        await message.reply("📭 Log file is empty.")
+        return
+    try:
+        await message.reply_document(
+            document=str(LOG_FILE),
+            caption="📄 Bot log file",
+        )
+    except Exception as e:
+        LOGGER.exception("Failed to send log")
+        await message.reply(f"❌ Could not send log: {e}")
 
 
 @app.on_message(filters.command("set_token") & filters.private)
@@ -328,6 +415,7 @@ async def document_handler(client: Client, message: Message):
         return
 
     status = await message.reply("📥 Downloading…")
+    LOGGER.info("User %s sent ZIP: %s (%s bytes)", user_id, file_name, file_size)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="tg_gh_"))
     zip_path = tmp_dir / file_name
@@ -336,6 +424,7 @@ async def document_handler(client: Client, message: Message):
     try:
         await client.download_media(message, file_name=str(zip_path))
         await status.edit_text("📦 Extracting…")
+        LOGGER.info("Downloaded to %s", zip_path)
 
         extract_dir.mkdir(parents=True, exist_ok=True)
 
@@ -346,6 +435,7 @@ async def document_handler(client: Client, message: Message):
                 zf.extract(member, extract_dir)
 
         files = await asyncio.to_thread(_collect_files, extract_dir)
+        LOGGER.info("Extracted %d files", len(files))
 
         if not files:
             await status.edit_text(
@@ -356,9 +446,7 @@ async def document_handler(client: Client, message: Message):
         # ========== DEFAULTS ==========
         repo_name = Path(file_name).stem
         repo_name = re.sub(r"[^\w.\-]", "-", repo_name).strip("-") or "uploaded-project"
-
-        create_new = True
-        private = True              # ← private by default
+        private = True
         branch = "main"
         commit_message = "Upload from Telegram bot"
         target_subdir = ""
@@ -374,10 +462,8 @@ async def document_handler(client: Client, message: Message):
             repo = _create_or_get_repo(
                 token,
                 repo_name,
-                create_new=create_new,
                 private=private,
             )
-
             url = _upload_files_single_commit(
                 repo,
                 files,
@@ -385,7 +471,6 @@ async def document_handler(client: Client, message: Message):
                 commit_message=commit_message,
                 target_subdir=target_subdir,
             )
-
             return repo.html_url, url
 
         repo_url, commit_url = await asyncio.to_thread(do_upload)
@@ -396,15 +481,20 @@ async def document_handler(client: Client, message: Message):
             f"Commit: {commit_url}\n"
             f"Files uploaded: {len(files)}"
         )
+        LOGGER.info("Upload success for user %s → %s", user_id, repo_url)
 
     except zipfile.BadZipFile:
+        LOGGER.warning("Bad ZIP from user %s", user_id)
         await status.edit_text("❌ The file is not a valid ZIP archive.")
     except ValueError as e:
+        LOGGER.error("ValueError: %s", e)
         await status.edit_text(f"❌ {e}")
     except GithubException as e:
         msg = e.data.get("message", str(e)) if e.data else str(e)
+        LOGGER.error("GitHub error (status=%s): %s", e.status, msg)
         await status.edit_text(f"❌ GitHub error: {msg}")
     except Exception as e:
+        LOGGER.exception("Unexpected error for user %s", user_id)
         await status.edit_text(
             f"❌ Unexpected error: {type(e).__name__}: {e}"
         )
@@ -421,6 +511,7 @@ if __name__ == "__main__":
         port = int(os.getenv("PORT", "8080"))
         await start_web(port)
         await app.start()
+        LOGGER.info("Bot started")
         print("Bot started…")
         await asyncio.Event().wait()
 
