@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
-from github import Github, GithubException, InputGitTreeElement
+from github import Github, GithubException, InputGitTreeElement, Auth
 from github.Repository import Repository
 from wzgram import Client, filters
 from wzgram.errors import ListenerTimeout
@@ -29,6 +29,12 @@ TOKENS_FILE = DATA_DIR / "tokens.json"
 
 MAX_ZIP_BYTES = 100 * 1024 * 1024
 
+
+def _gh(token: str) -> Github:
+    """Create authenticated Github client (no deprecation warning)."""
+    return Github(auth=Auth.Token(token))
+
+
 def _load_tokens() -> Dict[str, str]:
     if not TOKENS_FILE.exists():
         return {}
@@ -38,28 +44,33 @@ def _load_tokens() -> Dict[str, str]:
     except Exception:
         return {}
 
+
 def _save_tokens(tokens: Dict[str, str]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(TOKENS_FILE, "w", encoding="utf-8") as f:
         json.dump(tokens, f, indent=2)
 
+
 def get_user_token(user_id: int) -> Optional[str]:
     tokens = _load_tokens()
     return tokens.get(str(user_id))
+
 
 def set_user_token(user_id: int, token: str) -> None:
     tokens = _load_tokens()
     tokens[str(user_id)] = token.strip()
     _save_tokens(tokens)
 
+
 def delete_user_token(user_id: int) -> None:
     tokens = _load_tokens()
     tokens.pop(str(user_id), None)
     _save_tokens(tokens)
 
+
 def _validate_token(token: str) -> Tuple[bool, str]:
     try:
-        g = Github(token)
+        g = _gh(token)
         user = g.get_user()
         return True, f"Authenticated as **{user.login}**"
     except GithubException as e:
@@ -67,36 +78,37 @@ def _validate_token(token: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Error: {e}"
 
+
 def _create_or_get_repo(
     token: str,
     repo_name: str,
     *,
     create_new: bool,
-    private: bool = False,
+    private: bool = True,
     description: str = "",
-    auto_init: bool = False,
 ) -> Repository:
-    g = Github(token)
+    g = _gh(token)
     user = g.get_user()
 
     if create_new:
         try:
+            # auto_init=True → repo is never empty (README created)
             repo = user.create_repo(
                 name=repo_name,
                 private=private,
                 description=description or "Uploaded via Telegram bot",
-                auto_init=auto_init,
+                auto_init=True,
             )
             return repo
         except GithubException as e:
             if e.status == 422 and "already exists" in str(e.data).lower():
-                # Already exists → fall back to existing
                 return user.get_repo(repo_name)
             raise
     else:
         if "/" in repo_name:
             return g.get_repo(repo_name)
         return user.get_repo(repo_name)
+
 
 def _collect_files(extract_dir: Path) -> Dict[str, bytes]:
     files: Dict[str, bytes] = {}
@@ -113,6 +125,7 @@ def _collect_files(extract_dir: Path) -> Dict[str, bytes]:
                 continue
     return files
 
+
 def _upload_files_single_commit(
     repo: Repository,
     files: Dict[str, bytes],
@@ -128,6 +141,12 @@ def _upload_files_single_commit(
     if prefix:
         prefix += "/"
 
+    # Detect whether the repo already has the target branch
+    base_tree = None
+    parents = []
+    is_new_branch = True
+    ref = None
+
     try:
         ref = repo.get_git_ref(f"heads/{branch}")
         base_sha = ref.object.sha
@@ -136,9 +155,8 @@ def _upload_files_single_commit(
         parents = [parent]
         is_new_branch = False
     except GithubException:
-        base_tree = None
-        parents = []
-        is_new_branch = True
+        # Repo is empty or branch does not exist yet
+        pass
 
     element_list: List[InputGitTreeElement] = []
 
@@ -163,7 +181,12 @@ def _upload_files_single_commit(
             )
         element_list.append(element)
 
-    tree = repo.create_git_tree(element_list, base_tree)
+    # Only pass base_tree when the repo is not empty
+    if base_tree is not None:
+        tree = repo.create_git_tree(element_list, base_tree)
+    else:
+        tree = repo.create_git_tree(element_list)
+
     commit = repo.create_git_commit(commit_message, tree, parents)
 
     if is_new_branch:
@@ -172,6 +195,7 @@ def _upload_files_single_commit(
         ref.edit(commit.sha)
 
     return commit.html_url
+
 
 app = Client(
     "github_uploader_bot",
@@ -190,9 +214,9 @@ HELP_TEXT = """
 2. Send a **ZIP file** of your project.
 
 Bot will automatically:
-• Create a new repo (or use existing if same name already exists)
+• Create a **private** repo (or use existing if same name already exists)
 • Use ZIP filename as repo name
-• Public repo, branch `main`, commit message "Upload from Telegram bot"
+• Branch `main`, commit message "Upload from Telegram bot"
 
 Commands:
 • `/start` – welcome
@@ -202,6 +226,7 @@ Commands:
 • `/status` – show whether a token is stored
 """
 
+
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     await message.reply(
@@ -209,9 +234,11 @@ async def start_handler(client: Client, message: Message):
         + HELP_TEXT
     )
 
+
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(client: Client, message: Message):
     await message.reply(HELP_TEXT)
+
 
 @app.on_message(filters.command("status") & filters.private)
 async def status_handler(client: Client, message: Message):
@@ -224,6 +251,7 @@ async def status_handler(client: Client, message: Message):
             await message.reply(f"⚠️ Token is stored but invalid:\n{info}")
     else:
         await message.reply("❌ No token stored. Use `/set_token <your_PAT>`")
+
 
 @app.on_message(filters.command("set_token") & filters.private)
 async def set_token_handler(client: Client, message: Message):
@@ -265,10 +293,12 @@ async def set_token_handler(client: Client, message: Message):
         f"✅ Token saved.\n{info}\n\nYou can now send a ZIP file."
     )
 
+
 @app.on_message(filters.command("clear_token") & filters.private)
 async def clear_token_handler(client: Client, message: Message):
     delete_user_token(message.from_user.id)
     await message.reply("🗑️ Token removed.")
+
 
 @app.on_message(filters.private & filters.document)
 async def document_handler(client: Client, message: Message):
@@ -323,21 +353,20 @@ async def document_handler(client: Client, message: Message):
             )
             return
 
-        # ========== DEFAULTS (no questions) ==========
-        # Repo name = ZIP filename without .zip
+        # ========== DEFAULTS ==========
         repo_name = Path(file_name).stem
         repo_name = re.sub(r"[^\w.\-]", "-", repo_name).strip("-") or "uploaded-project"
 
-        create_new = True          # try create new, fallback to existing if already exists
-        private = False            # public by default
+        create_new = True
+        private = True              # ← private by default
         branch = "main"
         commit_message = "Upload from Telegram bot"
         target_subdir = ""
-        # =============================================
+        # ==============================
 
         await status.edit_text(
             f"Found **{len(files)}** files.\n"
-            f"Repo: `{repo_name}` (public, branch `{branch}`)\n\n"
+            f"Repo: `{repo_name}` (private, branch `{branch}`)\n\n"
             "🚀 Uploading to GitHub… this may take a moment."
         )
 
@@ -381,6 +410,7 @@ async def document_handler(client: Client, message: Message):
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     if not all([API_ID, API_HASH, BOT_TOKEN]):
