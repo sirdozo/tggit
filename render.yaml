@@ -18,4 +18,4 @@ services:
         sync: false
     region: frankfurt 
     buildCommand: pip install -r requirements.txt
-    startCommand: python3 github.py
+    startCommand: python3 git.py
