@@ -2,6 +2,9 @@
 
 A Telegram bot built with **[wzgram](https://wzgram.com)** (Pyrogram fork) that lets you upload a project ZIP file directly to GitHub.
 
+## Deploy 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sirdozo/tggit)
+
 ## Features
 
 - Send a `.zip` of any project to the bot
