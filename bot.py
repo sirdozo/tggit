@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Telegram → GitHub Uploader Bot (wzgram + PyGithub)
-
-Send a ZIP (or other archive) of a project to the bot.
-The bot extracts it and pushes the files to a GitHub repository
-(create new or update existing) using your Personal Access Token.
-
-Requirements:
-  pip install wzgram PyGithub python-dotenv
-
-Environment / config:
-  API_ID, API_HASH, BOT_TOKEN   – Telegram credentials
-  (optional) GITHUB_TOKEN can be set per-user via /set_token
-"""
 
 from __future__ import annotations
 
@@ -25,7 +11,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from github import Github, GithubException, InputGitTreeElement
@@ -36,24 +22,15 @@ from wzgram.types import Message
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Where we persist per-user GitHub PATs (simple JSON file)
 DATA_DIR = Path(__file__).parent / "data"
 TOKENS_FILE = DATA_DIR / "tokens.json"
 
-# Max size we will accept (Telegram bots can download up to ~2 GB with MTProto,
-# but keep a reasonable limit for safety)
-MAX_ZIP_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_ZIP_BYTES = 100 * 1024 * 1024
 
-# ---------------------------------------------------------------------------
-# Persistence helpers
-# ---------------------------------------------------------------------------
 def _load_tokens() -> Dict[str, str]:
     if not TOKENS_FILE.exists():
         return {}
@@ -63,35 +40,26 @@ def _load_tokens() -> Dict[str, str]:
     except Exception:
         return {}
 
-
 def _save_tokens(tokens: Dict[str, str]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(TOKENS_FILE, "w", encoding="utf-8") as f:
         json.dump(tokens, f, indent=2)
 
-
 def get_user_token(user_id: int) -> Optional[str]:
     tokens = _load_tokens()
     return tokens.get(str(user_id))
-
 
 def set_user_token(user_id: int, token: str) -> None:
     tokens = _load_tokens()
     tokens[str(user_id)] = token.strip()
     _save_tokens(tokens)
 
-
 def delete_user_token(user_id: int) -> None:
     tokens = _load_tokens()
     tokens.pop(str(user_id), None)
     _save_tokens(tokens)
 
-
-# ---------------------------------------------------------------------------
-# GitHub helpers (run in thread because PyGithub is sync)
-# ---------------------------------------------------------------------------
 def _validate_token(token: str) -> Tuple[bool, str]:
-    """Return (ok, message)."""
     try:
         g = Github(token)
         user = g.get_user()
@@ -100,7 +68,6 @@ def _validate_token(token: str) -> Tuple[bool, str]:
         return False, f"Invalid token: {e.data.get('message', str(e)) if e.data else str(e)}"
     except Exception as e:
         return False, f"Error: {e}"
-
 
 def _create_or_get_repo(
     token: str,
@@ -116,7 +83,6 @@ def _create_or_get_repo(
 
     if create_new:
         try:
-            # auto_init=False → empty repo (no README), so first commit can be ours
             repo = user.create_repo(
                 name=repo_name,
                 private=private,
@@ -126,22 +92,18 @@ def _create_or_get_repo(
             return repo
         except GithubException as e:
             if e.status == 422 and "already exists" in str(e.data).lower():
-                raise ValueError(f"Repository `{repo_name}` already exists. Use existing-repo mode.")
+                raise ValueError(
+                    f"Repository `{repo_name}` already exists. Use existing-repo mode."
+                )
             raise
     else:
-        # owner/repo or just repo (assumes own account)
         if "/" in repo_name:
             return g.get_repo(repo_name)
         return user.get_repo(repo_name)
 
-
 def _collect_files(extract_dir: Path) -> Dict[str, bytes]:
-    """Walk extract_dir and return {relative_path: content_bytes}.
-    Skips macOS junk and empty directories.
-    """
     files: Dict[str, bytes] = {}
     for root, dirs, filenames in os.walk(extract_dir):
-        # prune junk
         dirs[:] = [d for d in dirs if d not in ("__MACOSX", ".git")]
         for name in filenames:
             if name in (".DS_Store", "Thumbs.db"):
@@ -154,7 +116,6 @@ def _collect_files(extract_dir: Path) -> Dict[str, bytes]:
                 continue
     return files
 
-
 def _upload_files_single_commit(
     repo: Repository,
     files: Dict[str, bytes],
@@ -163,19 +124,13 @@ def _upload_files_single_commit(
     commit_message: str = "Upload from Telegram bot",
     target_subdir: str = "",
 ) -> str:
-    """
-    Create a single commit containing all files using the Git Data API.
-    Returns the commit HTML URL.
-    """
     if not files:
         raise ValueError("No files to upload")
 
-    # Normalize target subdir
     prefix = target_subdir.strip("/").strip()
     if prefix:
         prefix += "/"
 
-    # Decide whether the branch already exists
     try:
         ref = repo.get_git_ref(f"heads/{branch}")
         base_sha = ref.object.sha
@@ -184,15 +139,14 @@ def _upload_files_single_commit(
         parents = [parent]
         is_new_branch = False
     except GithubException:
-        # Branch does not exist yet (empty repo or first push)
         base_tree = None
         parents = []
         is_new_branch = True
 
     element_list: List[InputGitTreeElement] = []
+
     for rel_path, content in files.items():
         full_path = prefix + rel_path
-        # Detect binary vs text roughly
         try:
             text = content.decode("utf-8")
             element = InputGitTreeElement(
@@ -202,7 +156,6 @@ def _upload_files_single_commit(
                 content=text,
             )
         except UnicodeDecodeError:
-            # binary → create blob with base64
             b64 = base64.b64encode(content).decode("ascii")
             blob = repo.create_git_blob(b64, "base64")
             element = InputGitTreeElement(
@@ -217,24 +170,18 @@ def _upload_files_single_commit(
     commit = repo.create_git_commit(commit_message, tree, parents)
 
     if is_new_branch:
-        # Create the branch ref
         repo.create_git_ref(f"refs/heads/{branch}", commit.sha)
     else:
         ref.edit(commit.sha)
 
     return commit.html_url
 
-
-# ---------------------------------------------------------------------------
-# Bot
-# ---------------------------------------------------------------------------
 app = Client(
     "github_uploader_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
 )
-
 
 HELP_TEXT = """
 **Telegram → GitHub Uploader**
@@ -258,7 +205,6 @@ Commands:
 • `/status` – show whether a token is stored
 """
 
-
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     await message.reply(
@@ -266,11 +212,9 @@ async def start_handler(client: Client, message: Message):
         + HELP_TEXT
     )
 
-
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(client: Client, message: Message):
     await message.reply(HELP_TEXT)
-
 
 @app.on_message(filters.command("status") & filters.private)
 async def status_handler(client: Client, message: Message):
@@ -284,11 +228,10 @@ async def status_handler(client: Client, message: Message):
     else:
         await message.reply("❌ No token stored. Use `/set_token <your_PAT>`")
 
-
 @app.on_message(filters.command("set_token") & filters.private)
 async def set_token_handler(client: Client, message: Message):
-    # Prefer argument, otherwise ask
     parts = message.text.split(maxsplit=1)
+
     if len(parts) == 2:
         token = parts[1].strip()
     else:
@@ -309,33 +252,36 @@ async def set_token_handler(client: Client, message: Message):
         return
 
     ok, info = await asyncio.to_thread(_validate_token, token)
+
     if not ok:
         await message.reply(f"❌ {info}")
         return
 
     set_user_token(message.from_user.id, token)
-    # Delete the message that contained the token for privacy
+
     try:
         await message.delete()
     except Exception:
         pass
-    await message.reply(f"✅ Token saved.\n{info}\n\nYou can now send a ZIP file.")
 
+    await message.reply(
+        f"✅ Token saved.\n{info}\n\nYou can now send a ZIP file."
+    )
 
 @app.on_message(filters.command("clear_token") & filters.private)
 async def clear_token_handler(client: Client, message: Message):
     delete_user_token(message.from_user.id)
     await message.reply("🗑️ Token removed.")
 
-
 @app.on_message(filters.private & filters.document)
 async def document_handler(client: Client, message: Message):
     user_id = message.from_user.id
     token = get_user_token(user_id)
+
     if not token:
         await message.reply(
             "You need to set a GitHub token first.\n"
-            "Use `/set_token <your_PAT>` (needs `repo` scope)."
+            "Use `/set_token <PAT>` (needs `repo` scope)."
         )
         return
 
@@ -344,10 +290,12 @@ async def document_handler(client: Client, message: Message):
     file_size = doc.file_size or 0
 
     if file_size > MAX_ZIP_BYTES:
-        await message.reply(f"File is too large ({file_size // (1024*1024)} MB). Max allowed: {MAX_ZIP_BYTES // (1024*1024)} MB.")
+        await message.reply(
+            f"File is too large ({file_size // (1024 * 1024)} MB). "
+            f"Max allowed: {MAX_ZIP_BYTES // (1024 * 1024)} MB."
+        )
         return
 
-    # Only accept zip for now (easy to extend later)
     if not file_name.lower().endswith(".zip"):
         await message.reply("Please send a **.zip** archive of your project.")
         return
@@ -363,16 +311,19 @@ async def document_handler(client: Client, message: Message):
         await status.edit_text("📦 Extracting…")
 
         extract_dir.mkdir(parents=True, exist_ok=True)
+
         with zipfile.ZipFile(zip_path, "r") as zf:
-            # Security: prevent path traversal
             for member in zf.namelist():
                 if member.startswith("/") or ".." in Path(member).parts:
                     continue
                 zf.extract(member, extract_dir)
 
         files = await asyncio.to_thread(_collect_files, extract_dir)
+
         if not files:
-            await status.edit_text("The ZIP appears to be empty (or only contained junk files).")
+            await status.edit_text(
+                "The ZIP appears to be empty (or only contained junk files)."
+            )
             return
 
         await status.edit_text(
@@ -392,26 +343,42 @@ async def document_handler(client: Client, message: Message):
 
         mode = mode_msg.text.strip().lower()
         create_new = mode in ("new", "create", "n", "c")
-        if mode not in ("new", "create", "n", "c", "existing", "exist", "e", "old"):
+
+        if mode not in (
+            "new",
+            "create",
+            "n",
+            "c",
+            "existing",
+            "exist",
+            "e",
+            "old",
+        ):
             await message.reply("Please answer `new` or `existing`. Aborting.")
             return
 
-        # Repo name
         try:
             name_msg = await message.chat.ask(
-                "Repository name" + (" (will be created under your account)" if create_new else " (e.g. `my-project` or `owner/my-project`)") + ":",
+                "Repository name"
+                + (
+                    " (will be created under your account)"
+                    if create_new
+                    else " (e.g. `my-project` or `owner/my-project`)"
+                )
+                + ":",
                 filters=filters.text & filters.user(user_id),
                 timeout=120,
             )
         except ListenerTimeout:
             await message.reply("Timed out.")
             return
+
         repo_name = name_msg.text.strip().replace(" ", "-")
+
         if not re.match(r"^[\w.\-]+(/[\w.\-]+)?$", repo_name):
             await message.reply("Invalid repository name.")
             return
 
-        # Optional settings via a single free-form reply
         try:
             opts_msg = await message.chat.ask(
                 "Optional settings (press Enter / send `-` to use defaults):\n"
@@ -435,26 +402,31 @@ async def document_handler(client: Client, message: Message):
         if opts_text and opts_text != "-":
             if "private" in opts_text.lower():
                 private = True
+
             m = re.search(r"branch=([^\s]+)", opts_text, re.I)
             if m:
                 branch = m.group(1)
+
             m = re.search(r"msg=(.+?)(?:\s+\w+=|$)", opts_text, re.I)
             if m:
                 commit_message = m.group(1).strip()
+
             m = re.search(r"path=([^\s]+)", opts_text, re.I)
             if m:
                 target_subdir = m.group(1)
 
-        await status.edit_text("🚀 Uploading to GitHub… this may take a moment.")
+        await status.edit_text(
+            "🚀 Uploading to GitHub… this may take a moment."
+        )
 
-        def do_upload() -> str:
+        def do_upload() -> Tuple[str, str]:
             repo = _create_or_get_repo(
                 token,
                 repo_name,
                 create_new=create_new,
                 private=private,
             )
-            # For brand-new empty repos the default branch may not exist yet
+
             url = _upload_files_single_commit(
                 repo,
                 files,
@@ -462,6 +434,7 @@ async def document_handler(client: Client, message: Message):
                 commit_message=commit_message,
                 target_subdir=target_subdir,
             )
+
             return repo.html_url, url
 
         repo_url, commit_url = await asyncio.to_thread(do_upload)
@@ -481,17 +454,19 @@ async def document_handler(client: Client, message: Message):
         msg = e.data.get("message", str(e)) if e.data else str(e)
         await status.edit_text(f"❌ GitHub error: {msg}")
     except Exception as e:
-        await status.edit_text(f"❌ Unexpected error: {type(e).__name__}: {e}")
+        await status.edit_text(
+            f"❌ Unexpected error: {type(e).__name__}: {e}"
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     if not all([API_ID, API_HASH, BOT_TOKEN]):
-        print("Please set API_ID, API_HASH and BOT_TOKEN environment variables (or in a .env file).")
+        print(
+            "Please set API_ID, API_HASH and BOT_TOKEN environment variables "
+            "(or in a .env file)."
+        )
         raise SystemExit(1)
+
     print("Bot starting…")
     app.run()
