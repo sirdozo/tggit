@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: Tg-Link
+    runtime: python
+    repo: https://github.com/sirdozo/tggit
+    branch: main
+    plan: free
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+    region: frankfurt 
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 github.py
